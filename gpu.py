@@ -203,12 +203,15 @@ def matvec_viscosity_fused_kernel(
         tgx = wp.float32(0.0)
         tgy = wp.float32(0.0)
         for j in range(25):
-            v_eta = eta_local[j] * (gux_x[j] * Dx_phys[j * 25 + i] + gux_y[j] * Dy_phys[j * 25 + i])
-            v_etaH = etaH_local[j] * (guy_x[j] * Dx_phys[j * 25 + i] + guy_y[j] * Dy_phys[j * 25 + i])
-            tgx += M_local[j] * (v_eta - v_etaH)
-            
-            tgy += M_local[j] * (etaH_local[j] * (gux_x[j] * Dx_phys[j * 25 + i] + gux_y[j] * Dy_phys[j * 25 + i]) + 
-                                 eta_local[j] * (guy_x[j] * Dx_phys[j * 25 + i] + guy_y[j] * Dy_phys[j * 25 + i]))
+            v_eta_x = eta_local[j] * (gux_x[j] * Dx_phys[j * 25 + i] + gux_y[j] * Dy_phys[j * 25 + i])
+            v_etaH_x = etaH_local[j] * (gux_x[j] * Dy_phys[j * 25 + i] - gux_y[j] * Dx_phys[j * 25 + i])
+
+            v_eta_y = eta_local[j] * (guy_x[j] * Dx_phys[j * 25 + i] + guy_y[j] * Dy_phys[j * 25 + i])
+            v_etaH_y = etaH_local[j] * (-guy_x[j] * Dy_phys[j * 25 + i] + guy_y[j] * Dx_phys[j * 25 + i])
+
+            # Couple x and y spatial gradients for Hall viscosity (transverse force)
+            tgx += M_local[j] * (v_eta_x - v_etaH_y)
+            tgy += M_local[j] * (v_eta_y + v_etaH_x)
         
         idx = e * 25 + i
         y[50 * Ne + idx] += dt_gamma * (vg2 * tgx + (local_x_gx[i] / tau_avg_safe) * M_local[i])
@@ -332,17 +335,20 @@ def matvec_viscosity_fused_kernel(
                     y[50 * Ne + loc] += dt_gamma * vg2 * flux_x * wq
                     y[75 * Ne + loc] += dt_gamma * vg2 * flux_y * wq
 
+"""
+Calculates the ideal, convective portion of the equations including
+thermodynamic pressure gradients and convective derivatives.
+Uses a local Lax-Friedrichs flux for stable shock capturing at boundaries.
+"""
 @wp.kernel
-def compute_explicit_rhs_warp_kernel(
+def compute_explicit_euler_flux_kernel(
     U: wp.array(dtype=wp.float32),
     rhs: wp.array(dtype=wp.float32),
     M_local: wp.array(dtype=wp.float32),
     Dx_phys: wp.array(dtype=wp.float32),
     Dy_phys: wp.array(dtype=wp.float32),
-    Ex_full: wp.array(dtype=wp.float32),
-    Ey_full: wp.array(dtype=wp.float32),
     nx: wp.int32, ny: wp.int32, Ne: wp.int32,
-    B_field: wp.float32, vg2: wp.float32, e_charge: wp.float32, c_light: wp.float32,
+    vg2: wp.float32,
     n_src: wp.float32, nE_src: wp.float32, n_drn: wp.float32, nE_drn: wp.float32,
     qpc_faces: wp.array(dtype=wp.int32),
     qpc_centers: wp.array(dtype=wp.float32),
@@ -414,14 +420,6 @@ def compute_explicit_rhs_warp_kernel(
         rhs[25 * Ne + idx] = -rnE_acc * M_local[i]
         rhs[50 * Ne + idx] = -rgx_acc * M_local[i]
         rhs[75 * Ne + idx] = -rgy_acc * M_local[i]
-        Ex = Ex_full[idx]
-        Ey = Ey_full[idx]
-        jx = local_n[i] * local_ux[i]
-        jy = local_n[i] * local_uy[i]
-        
-        rhs[25 * Ne + idx] += e_charge * (Ex * jx + Ey * jy) * M_local[i]
-        rhs[50 * Ne + idx] += (e_charge * local_n[i] * Ex + (e_charge / c_light) * jy * B_field) * M_local[i]
-        rhs[75 * Ne + idx] += (e_charge * local_n[i] * Ey - (e_charge / c_light) * jx * B_field) * M_local[i]
 
     ex = e % nx
     ey = e // nx
@@ -474,7 +472,6 @@ def compute_explicit_rhs_warp_kernel(
                     gy2 = -gn1 * ny_f + gt1 * nx_f
                     n2, nE2 = n1, nE1
             else:
-                # FIXED: Properly map neighbor face nodes
                 neighbor_face = int(2) if face == 0 else int(3) if face == 1 else int(0) if face == 2 else int(1)
                 idx2 = face_nodes[neighbor_face, q]
                 
@@ -508,6 +505,81 @@ def compute_explicit_rhs_warp_kernel(
             rhs[25 * Ne + loc] -= (half * (f1nE + f2nE) - half * lam * (nE2 - nE1) - f1nE) * wq
             rhs[50 * Ne + loc] -= (half * (f1gx + f2gx) - half * lam * (gx2 - gx1) - f1gx) * wq
             rhs[75 * Ne + loc] -= (half * (f1gy + f2gy) - half * lam * (gy2 - gy1) - f1gy) * wq
+
+"""
+Applies external electromagnetic forces algebraically.
+Adds macroscopic Lorentz force to the momentum continuity equation,
+and Joule heating dissipation to the energy density equation.
+"""
+@wp.kernel
+def compute_electromagnetic_source_kernel(
+    U: wp.array(dtype=wp.float32),
+    rhs: wp.array(dtype=wp.float32),
+    M_local: wp.array(dtype=wp.float32),
+    Ex_full: wp.array(dtype=wp.float32),
+    Ey_full: wp.array(dtype=wp.float32),
+    Ne: wp.int32,
+    B_field: wp.float32, vg2: wp.float32, e_charge: wp.float32, c_light: wp.float32
+):
+    e = wp.tid()
+    if e >= Ne:
+        return
+
+    for i in range(25):
+        idx = e * 25 + i
+        local_n = U[idx]
+        local_nE = U[25 * Ne + idx]
+        local_gx = U[50 * Ne + idx]
+        local_gy = U[75 * Ne + idx]
+
+        ux, uy, _, _ = get_primitives_wp(local_n, local_nE, local_gx, local_gy, vg2)
+
+        Ex = Ex_full[idx]
+        Ey = Ey_full[idx]
+        jx = local_n * ux
+        jy = local_n * uy
+
+        rhs[25 * Ne + idx] += e_charge * (Ex * jx + Ey * jy) * M_local[i]
+        rhs[50 * Ne + idx] += (e_charge * local_n * Ex + (e_charge / c_light) * jy * B_field) * M_local[i]
+        rhs[75 * Ne + idx] += (e_charge * local_n * Ey - (e_charge / c_light) * jx * B_field) * M_local[i]
+
+"""
+Enforces sub-relativistic velocity limits to prevent imaginary numbers
+when computing primitive variables. Applied to the intermediate state 'b'
+before it enters the GMRES solver.
+"""
+@wp.kernel
+def clamp_b_state_kernel(
+    b: wp.array(dtype=wp.float32),
+    Ne: wp.int32,
+    vg2: wp.float32
+):
+    e = wp.tid()
+    if e >= Ne:
+        return
+
+    for i in range(25):
+        idx = e * 25 + i
+        n_val = b[idx]
+        nE_val = b[25 * Ne + idx]
+        gx_val = b[50 * Ne + idx]
+        gy_val = b[75 * Ne + idx]
+
+        g_norm = wp.sqrt(gx_val * gx_val + gy_val * gy_val)
+        nE_safe = wp.max(nE_val, wp.float32(1e-6))
+
+        u_norm = wp.float32(0.0)
+        if g_norm > wp.float32(1e-6):
+            disc = wp.float32(9.0) * nE_safe * nE_safe - wp.float32(8.0) * g_norm * g_norm * vg2
+            u_norm = (wp.float32(3.0) * nE_safe - wp.sqrt(wp.max(disc, wp.float32(0.0)))) / (wp.float32(2.0) * g_norm)
+        else:
+            u_norm = (wp.float32(2.0) * g_norm * vg2) / (wp.float32(3.0) * nE_safe)
+
+        limit = wp.float32(0.999) * wp.sqrt(vg2)
+        if u_norm > limit:
+            scale = limit / u_norm
+            b[50 * Ne + idx] = gx_val * scale
+            b[75 * Ne + idx] = gy_val * scale
 
 @wp.kernel
 def compute_b_stage1_kernel(
@@ -1170,18 +1242,21 @@ def main():
     dump_snapshot(0, Ufinal_host.numpy(), phi_host.numpy(), Ex_host.numpy(), Ey_host.numpy())
     print("Capturing CUDA Graph...")
     wp.capture_begin()
-    
+
     # STAGE 1
     solve_electrostatics_gpu(U_gpu)
     rhs_n_gpu.zero_()
-    wp.launch(compute_explicit_rhs_warp_kernel, dim=Ne, inputs=[
-        U_gpu, rhs_n_gpu, M_local_gpu, Dx_phys_gpu, Dy_phys_gpu, Ex_gpu, Ey_gpu,
-        nx_grid, ny_grid, Ne, wp.float32(B_field), wp.float32(vg2), wp.float32(e_charge), wp.float32(c_light), 
+    wp.launch(compute_explicit_euler_flux_kernel, dim=Ne, inputs=[
+        U_gpu, rhs_n_gpu, M_local_gpu, Dx_phys_gpu, Dy_phys_gpu,
+        nx_grid, ny_grid, Ne, wp.float32(vg2),
         wp.float32(n_src), wp.float32(nE_src), wp.float32(n_drn), wp.float32(nE_drn),
         qpc_f_gpu, qpc_c_gpu, qpc_w_gpu, qpc_t_gpu, f_nodes_gpu, norm_v_gpu, w1d_gpu, wp.float32(hx), wp.float32(hy)])
+    wp.launch(compute_electromagnetic_source_kernel, dim=Ne, inputs=[
+        U_gpu, rhs_n_gpu, M_local_gpu, Ex_gpu, Ey_gpu, Ne, wp.float32(B_field), wp.float32(vg2), wp.float32(e_charge), wp.float32(c_light)])
 
     wp.launch(compute_b_stage1_kernel, dim=4*N, inputs=[
         U_gpu, rhs_n_gpu, M_local_gpu, wp.float32(dt * gamma), b_stage_gpu])
+    wp.launch(clamp_b_state_kernel, dim=Ne, inputs=[b_stage_gpu, Ne, wp.float32(vg2)])
 
     wp.copy(U_1_gpu, U_gpu) 
     warp_solver.solve(
@@ -1193,18 +1268,20 @@ def main():
     # STAGE 2
     solve_electrostatics_gpu(U_1_gpu)
     rhs_1_gpu.zero_()
-    wp.launch(compute_explicit_rhs_warp_kernel, dim=Ne, inputs=[
-        U_1_gpu, rhs_1_gpu, M_local_gpu, Dx_phys_gpu, Dy_phys_gpu, Ex_gpu, Ey_gpu,
-        nx_grid, ny_grid, Ne, wp.float32(B_field), wp.float32(vg2), wp.float32(e_charge), wp.float32(c_light), 
+    wp.launch(compute_explicit_euler_flux_kernel, dim=Ne, inputs=[
+        U_1_gpu, rhs_1_gpu, M_local_gpu, Dx_phys_gpu, Dy_phys_gpu,
+        nx_grid, ny_grid, Ne, wp.float32(vg2),
         wp.float32(n_src), wp.float32(nE_src), wp.float32(n_drn), wp.float32(nE_drn),
         qpc_f_gpu, qpc_c_gpu, qpc_w_gpu, qpc_t_gpu, f_nodes_gpu, norm_v_gpu, w1d_gpu, wp.float32(hx), wp.float32(hy)])
+    wp.launch(compute_electromagnetic_source_kernel, dim=Ne, inputs=[
+        U_1_gpu, rhs_1_gpu, M_local_gpu, Ex_gpu, Ey_gpu, Ne, wp.float32(B_field), wp.float32(vg2), wp.float32(e_charge), wp.float32(c_light)])
     
     c_n = (2.0 * gamma - 1.0) / gamma
     c_1 = (1.0 - gamma) / gamma
     dt_gamma2 = dt * gamma
-
     wp.launch(compute_b_stage2_kernel, dim=4*N, inputs=[
         U_gpu, U_1_gpu, rhs_1_gpu, M_local_gpu, wp.float32(dt_gamma2), wp.float32(c_n), wp.float32(c_1), b_stage_gpu])
+    wp.launch(clamp_b_state_kernel, dim=Ne, inputs=[b_stage_gpu, Ne, wp.float32(vg2)])
 
     warp_solver.solve(
         U_1_gpu, b_stage_gpu, wp.float32(dt * gamma), U_1_gpu, M_local_gpu, Dx_phys_gpu, Dy_phys_gpu, D1d_phys_x_gpu, D1d_phys_y_gpu, 
